@@ -31,8 +31,8 @@ jobs:
       - name: Execute Live Trading
         env:
           # Passa le chiavi Alpaca come segreti di GitHub per sicurezza
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_V6 }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY_V6 }}
           ALPACA_PAPER: true
-        run: python live_predict_trade.py -m nn_v6 --pool_size 100 
+        run: python live_predict_trade.py -m nn_v6 --pool_size 100
         # run: python live_predict_trade.py -m nn_v6 --pool_size 100 --execute
