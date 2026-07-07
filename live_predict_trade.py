@@ -316,7 +316,7 @@ def rebuild_portfolio_state(alpaca_client: AlpacaClient) -> Portfolio:
     return portfolio
 
 
-def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dict[str, Any]], portfolio: Portfolio, tickers: List[str]) -> List[str]:
+def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dict[str, Any]], portfolio: Portfolio, tickers: List[str], max_slots: int = 8) -> List[str]:
     """
     Invia gli ordini necessari ad Alpaca per allineare il portafoglio reale
     con le decisioni generate dalla strategia.
@@ -339,6 +339,8 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
                 logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
                 trades_log.append(msg)
+                # Aggiorniamo lo stato locale del portafoglio per il conteggio degli slot
+                del portfolio.positions[ticker]
             
             # Se abbiamo una posizione opposta a quella voluta
             elif action == "BUY" and pos.position_type == "SHORT":
@@ -346,11 +348,13 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
                 logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
                 trades_log.append(msg)
+                del portfolio.positions[ticker]
             elif action == "SELL_SHORT" and pos.position_type == "LONG":
                 msg = f"🔄 Inversione: Chiusura LONG di {pos.shares} quote su {ticker}."
                 logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
                 trades_log.append(msg)
+                del portfolio.positions[ticker]
 
     # 2. Gestione degli Acquisti / Apertura Posizioni
     # Recuperiamo l'equity per calcolare le size corrette
@@ -367,39 +371,45 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
 
         # Se non abbiamo posizioni attive e il segnale è BUY
         if ticker not in portfolio.positions:
-            if action == "BUY":
-                # Calcola il valore in USD da investire
-                investment_usd = float(account_info["equity"]) * weight
-                # Se supera la cassa disponibile, riduciamo all'85% della cassa per sicurezza/commissioni
-                if investment_usd > available_cash:
-                    investment_usd = available_cash * 0.95
+            if action in ["BUY", "SELL_SHORT"]:
+                # Verifichiamo il limite massimo di posizioni (slots)
+                if len(portfolio.positions) >= max_slots:
+                    logger.warning(f"Limite massimo posizioni ({max_slots}) raggiunto. Salto apertura su {ticker}.")
+                    continue
 
-                if investment_usd > 10.0:  # Soglia minima $10 per trade
-                    # Otteniamo l'ultimo prezzo di chiusura per stimare le quote da comprare
-                    db = DBManager()
-                    last_price_df = db.execute_query("SELECT close FROM ohlcv WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1", (ticker,))
-                    if not last_price_df.empty:
-                        last_close = float(last_price_df.iloc[0, 0])
-                        qty_to_buy = int(investment_usd / last_close)
-                        if qty_to_buy > 0:
-                            # Calcolo dei prezzi di SL e TP per l'ordine bracket
-                            sl_pct = signal.get("stop_loss_pct")
-                            tp_pct = signal.get("take_profit_pct")
-                            sl_price = round(last_close * (1.0 - sl_pct), 2) if sl_pct else None
-                            tp_price = round(last_close * (1.0 + tp_pct), 2) if tp_pct else None
-                            
-                            msg = f"🟢 BUY {ticker}: {qty_to_buy} quote (Prezzo: ${last_close:.2f}, SL: {sl_price}, TP: {tp_price})."
-                            logger.info(f"[ORDINE] {msg}")
-                            alpaca_client.submit_order(
-                                ticker=ticker, 
-                                qty=qty_to_buy, 
-                                side="buy",
-                                stop_loss_price=sl_price,
-                                take_profit_price=tp_price
-                            )
-                            trades_log.append(msg)
-                        else:
-                            logger.warning(f"Capitale insufficiente per comprare anche 1 quota di {ticker} a ${last_close:.2f}")
+                if action == "BUY":
+                    # Calcola il valore in USD da investire
+                    investment_usd = float(account_info["equity"]) * weight
+                    # Se supera la cassa disponibile, riduciamo all'85% della cassa per sicurezza/commissioni
+                    if investment_usd > available_cash:
+                        investment_usd = available_cash * 0.95
+
+                    if investment_usd > 10.0:  # Soglia minima $10 per trade
+                        # Otteniamo l'ultimo prezzo di chiusura per stimare le quote da comprare
+                        db = DBManager()
+                        last_price_df = db.execute_query("SELECT close FROM ohlcv WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1", (ticker,))
+                        if not last_price_df.empty:
+                            last_close = float(last_price_df.iloc[0, 0])
+                            qty_to_buy = int(investment_usd / last_close)
+                            if qty_to_buy > 0:
+                                # Calcolo dei prezzi di SL e TP per l'ordine bracket
+                                sl_pct = signal.get("stop_loss_pct")
+                                tp_pct = signal.get("take_profit_pct")
+                                sl_price = round(last_close * (1.0 - sl_pct), 2) if sl_pct else None
+                                tp_price = round(last_close * (1.0 + tp_pct), 2) if tp_pct else None
+                                
+                                msg = f"🟢 BUY {ticker}: {qty_to_buy} quote (Prezzo: ${last_close:.2f}, SL: {sl_price}, TP: {tp_price})."
+                                logger.info(f"[ORDINE] {msg}")
+                                alpaca_client.submit_order(
+                                    ticker=ticker, 
+                                    qty=qty_to_buy, 
+                                    side="buy",
+                                    stop_loss_price=sl_price,
+                                    take_profit_price=tp_price
+                                )
+                                trades_log.append(msg)
+                            else:
+                                logger.warning(f"Capitale insufficiente per comprare anche 1 quota di {ticker} a ${last_close:.2f}")
             
             elif action == "SELL_SHORT":
                 investment_usd = float(account_info["equity"]) * weight
@@ -511,6 +521,19 @@ def main():
         help="Se specificato, seleziona i primi N ticker più attivi nel database automaticamente."
     )
 
+    parser.add_argument(
+        "--max_slots",
+        type=int,
+        default=8,
+        help="Numero massimo di posizioni aperte contemporaneamente (default: 8)."
+    )
+
+    parser.add_argument(
+        "--alphabetical",
+        action="store_true",
+        help="Se attivo e --pool_size è impostato, seleziona i ticker in ordine alfabetico invece che per volume medio."
+    )
+
     args = parser.parse_args()
 
     print("\n" + "="*75)
@@ -527,9 +550,14 @@ def main():
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
         logger.info(f"Configurata lista personalizzata di {len(tickers)} ticker.")
     elif args.pool_size is not None:
-        query = "SELECT ticker, AVG(volume) as avg_vol FROM ohlcv GROUP BY ticker ORDER BY avg_vol DESC LIMIT ?"
-        tickers = db.execute_query(query, (args.pool_size,))['ticker'].tolist()
-        logger.info(f"Selezionati automaticamente i primi {args.pool_size} ticker più attivi dal DB.")
+        if args.alphabetical:
+            query = "SELECT DISTINCT ticker FROM ohlcv ORDER BY ticker ASC LIMIT ?"
+            tickers = db.execute_query(query, (args.pool_size,))['ticker'].tolist()
+            logger.info(f"Selezionati automaticamente i primi {args.pool_size} ticker in ordine alfabetico dal DB.")
+        else:
+            query = "SELECT ticker, AVG(volume) as avg_vol FROM ohlcv GROUP BY ticker ORDER BY avg_vol DESC LIMIT ?"
+            tickers = db.execute_query(query, (args.pool_size,))['ticker'].tolist()
+            logger.info(f"Selezionati automaticamente i primi {args.pool_size} ticker più attivi dal DB.")
     else:
         tickers = config.TICKERS
         logger.info("Nessuna lista specificata. Utilizzo dei ticker predefiniti in config.py.")
@@ -588,7 +616,13 @@ def main():
     
     if args.execute:
         logger.info("🚀 Modalità ESECUZIONE ATTIVA! Invio degli ordini di allineamento ad Alpaca...")
-        executed_trades = execute_trades_on_alpaca(alpaca_client, signals, portfolio, list(historical_data.keys()))
+        executed_trades = execute_trades_on_alpaca(
+            alpaca_client, 
+            signals, 
+            portfolio, 
+            list(historical_data.keys()),
+            max_slots=args.max_slots
+        )
         if executed_trades:
             telegram_lines = executed_trades
         else:
