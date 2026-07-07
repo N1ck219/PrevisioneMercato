@@ -1,0 +1,38 @@
+name: Daily Live Trading
+
+on:
+  schedule:
+    # Esegue il workflow da lunedì a venerdì alle 21:35 UTC (regola l'orario in base alla chiusura/fuso orario)
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch: # Permette l'avvio manuale da GitHub
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-node: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      # 1. Scarica i dati e aggiorna il database SQLite
+      - name: Run Data Ingestion
+        run: python run_ingestion.py --sp500 -y 1
+
+      # 2. Esegue le previsioni ed effettua gli ordini reali/paper
+      - name: Execute Live Trading
+        env:
+          # Passa le chiavi Alpaca come segreti di GitHub per sicurezza
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: true
+        run: python live_predict_trade.py -m nn_v6 --pool_size 100 
+        # run: python live_predict_trade.py -m nn_v6 --pool_size 100 --execute

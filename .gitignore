@@ -1,0 +1,35 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Environments / Credentials (CRITICAL)
+.env
+.env.*
+!.env.example
+
+# Large Data & Database (CRITICAL - 700MB+)
+database/*.db
+database/*.db-journal
+database/*.db-wal
+database/*.db-shm
+
+# Run Outputs / Backtest reports / Real results
+risultati_backtest/
+risultati_reali/
+*.log
+live_trading.log
+
+# IDE settings
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
