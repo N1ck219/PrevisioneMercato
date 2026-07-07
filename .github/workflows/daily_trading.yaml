@@ -2,8 +2,9 @@ name: Daily Live Trading
 
 on:
   schedule:
-    # Esegue il workflow da lunedì a venerdì alle 21:35 UTC (regola l'orario in base alla chiusura/fuso orario)
-    - cron: '30 21 * * 1-5'
+    # Esegue il workflow da lunedì a venerdì alle 19:45 UTC (21:45 italiane / 15:45 di New York)
+    # Questo lascia 15 minuti di margine prima della chiusura di Wall Street (16:00 NY time)
+    - cron: '45 19 * * 1-5'
   workflow_dispatch: # Permette l'avvio manuale da GitHub
 
 jobs:
@@ -16,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-node: '3.10'
+          python-version: '3.10'
           cache: 'pip'
 
       - name: Install dependencies
@@ -30,9 +31,11 @@ jobs:
       # 2. Esegue le previsioni ed effettua gli ordini reali/paper
       - name: Execute Live Trading
         env:
-          # Passa le chiavi Alpaca come segreti di GitHub per sicurezza
+          # Passa le chiavi Alpaca e Telegram come segreti di GitHub per sicurezza
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_V6 }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY_V6 }}
           ALPACA_PAPER: true
-        run: python live_predict_trade.py -m nn_v6 --pool_size 100
-        # run: python live_predict_trade.py -m nn_v6 --pool_size 100 --execute
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # run: python live_predict_trade.py -m nn_v6 --pool_size 100
+        run: python live_predict_trade.py -m nn_v6 --pool_size 100 --execute

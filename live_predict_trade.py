@@ -99,8 +99,17 @@ class AlpacaClient:
         response.raise_for_status()
         return response.json()
 
-    def submit_order(self, ticker: str, qty: float, side: str, order_type: str = "market", time_in_force: str = "gtc") -> Dict[str, Any]:
-        """Invia un ordine ad Alpaca."""
+    def submit_order(
+        self, 
+        ticker: str, 
+        qty: float, 
+        side: str, 
+        order_type: str = "market", 
+        time_in_force: str = "gtc",
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Invia un ordine ad Alpaca (supporta ordini bracket per SL/TP)."""
         url = f"{self.base_url}/v2/orders"
         data = {
             "symbol": ticker,
@@ -109,6 +118,14 @@ class AlpacaClient:
             "type": order_type,
             "time_in_force": time_in_force
         }
+        
+        if take_profit_price is not None or stop_loss_price is not None:
+            data["order_class"] = "bracket"
+            if take_profit_price is not None:
+                data["take_profit"] = {"limit_price": f"{take_profit_price:.2f}"}
+            if stop_loss_price is not None:
+                data["stop_loss"] = {"stop_price": f"{stop_loss_price:.2f}"}
+                
         response = requests.post(url, json=data, headers=self.headers, timeout=15)
         if response.status_code != 200 and response.status_code != 201:
             logger.error(f"Errore invio ordine per {ticker}: {response.text}")
@@ -299,12 +316,14 @@ def rebuild_portfolio_state(alpaca_client: AlpacaClient) -> Portfolio:
     return portfolio
 
 
-def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dict[str, Any]], portfolio: Portfolio, tickers: List[str]):
+def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dict[str, Any]], portfolio: Portfolio, tickers: List[str]) -> List[str]:
     """
     Invia gli ordini necessari ad Alpaca per allineare il portafoglio reale
     con le decisioni generate dalla strategia.
+    Ritorna una lista di stringhe con i dettagli delle operazioni effettuate.
     """
     logger.info("\n=== INIZIO FASE DI ESECUZIONE ORDINI ===\n")
+    trades_log: List[str] = []
     
     # 1. Gestione delle Vendite / Chiusure Posizioni (eseguite per prime per sbloccare liquidità)
     for ticker in tickers:
@@ -316,16 +335,22 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
             # Se la strategia dice SELL e abbiamo una posizione LONG aperta, oppure se dice BUY_TO_COVER e siamo SHORT
             if (action == "SELL" and pos.position_type == "LONG") or \
                (action == "BUY_TO_COVER" and pos.position_type == "SHORT"):
-                logger.info(f"[ORDINE] Chiusura posizione su {ticker} ({pos.position_type}): {pos.shares} quote.")
+                msg = f"🔄 Chiusura posizione su {ticker} ({pos.position_type}): {pos.shares} quote."
+                logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
+                trades_log.append(msg)
             
             # Se abbiamo una posizione opposta a quella voluta
             elif action == "BUY" and pos.position_type == "SHORT":
-                logger.info(f"[ORDINE] Inversione: Chiusura SHORT di {pos.shares} quote su {ticker}.")
+                msg = f"🔄 Inversione: Chiusura SHORT di {pos.shares} quote su {ticker}."
+                logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
+                trades_log.append(msg)
             elif action == "SELL_SHORT" and pos.position_type == "LONG":
-                logger.info(f"[ORDINE] Inversione: Chiusura LONG di {pos.shares} quote su {ticker}.")
+                msg = f"🔄 Inversione: Chiusura LONG di {pos.shares} quote su {ticker}."
+                logger.info(f"[ORDINE] {msg}")
                 alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
+                trades_log.append(msg)
 
     # 2. Gestione degli Acquisti / Apertura Posizioni
     # Recuperiamo l'equity per calcolare le size corrette
@@ -336,7 +361,9 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
     for ticker in tickers:
         signal = signals.get(ticker, {"action": "HOLD"})
         action = signal["action"]
-        weight = signal.get("weight", config.BACKTEST_MAX_POSITION_SIZE)
+        # Calcolo del peso reale basato sulla size massima modificata dal confidence_multiplier del modello
+        base_weight = config.BACKTEST_MAX_POSITION_SIZE
+        weight = signal.get("weight", base_weight * signal.get("confidence_multiplier", 1.0))
 
         # Se non abbiamo posizioni attive e il segnale è BUY
         if ticker not in portfolio.positions:
@@ -349,16 +376,28 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
 
                 if investment_usd > 10.0:  # Soglia minima $10 per trade
                     # Otteniamo l'ultimo prezzo di chiusura per stimare le quote da comprare
-                    latest_price = float(alpaca_client.base_url.replace("paper-api", "data") != "") # placeholder, leggiamo da DB
-                    # Usiamo il database per ricavare l'ultimo prezzo
                     db = DBManager()
                     last_price_df = db.execute_query("SELECT close FROM ohlcv WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1", (ticker,))
                     if not last_price_df.empty:
                         last_close = float(last_price_df.iloc[0, 0])
                         qty_to_buy = int(investment_usd / last_close)
                         if qty_to_buy > 0:
-                            logger.info(f"[ORDINE] Apertura LONG su {ticker}: {qty_to_buy} quote (Valore stimato: ${qty_to_buy * last_close:.2f}).")
-                            alpaca_client.submit_order(ticker=ticker, qty=qty_to_buy, side="buy")
+                            # Calcolo dei prezzi di SL e TP per l'ordine bracket
+                            sl_pct = signal.get("stop_loss_pct")
+                            tp_pct = signal.get("take_profit_pct")
+                            sl_price = round(last_close * (1.0 - sl_pct), 2) if sl_pct else None
+                            tp_price = round(last_close * (1.0 + tp_pct), 2) if tp_pct else None
+                            
+                            msg = f"🟢 BUY {ticker}: {qty_to_buy} quote (Prezzo: ${last_close:.2f}, SL: {sl_price}, TP: {tp_price})."
+                            logger.info(f"[ORDINE] {msg}")
+                            alpaca_client.submit_order(
+                                ticker=ticker, 
+                                qty=qty_to_buy, 
+                                side="buy",
+                                stop_loss_price=sl_price,
+                                take_profit_price=tp_price
+                            )
+                            trades_log.append(msg)
                         else:
                             logger.warning(f"Capitale insufficiente per comprare anche 1 quota di {ticker} a ${last_close:.2f}")
             
@@ -374,10 +413,49 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
                         last_close = float(last_price_df.iloc[0, 0])
                         qty_to_short = int(investment_usd / last_close)
                         if qty_to_short > 0:
-                            logger.info(f"[ORDINE] Apertura SHORT su {ticker}: {qty_to_short} quote (Valore stimato: ${qty_to_short * last_close:.2f}).")
-                            alpaca_client.submit_order(ticker=ticker, qty=qty_to_short, side="sell")
+                            # Calcolo dei prezzi di SL e TP per l'ordine bracket
+                            sl_pct = signal.get("stop_loss_pct")
+                            tp_pct = signal.get("take_profit_pct")
+                            sl_price = round(last_close * (1.0 + sl_pct), 2) if sl_pct else None
+                            tp_price = round(last_close * (1.0 - tp_pct), 2) if tp_pct else None
+                            
+                            msg = f"🔴 SELL SHORT {ticker}: {qty_to_short} quote (Prezzo: ${last_close:.2f}, SL: {sl_price}, TP: {tp_price})."
+                            logger.info(f"[ORDINE] {msg}")
+                            alpaca_client.submit_order(
+                                ticker=ticker, 
+                                qty=qty_to_short, 
+                                side="sell",
+                                stop_loss_price=sl_price,
+                                take_profit_price=tp_price
+                            )
+                            trades_log.append(msg)
 
     logger.info("\n=== FASE DI ESECUZIONE ORDINI COMPLETATA ===\n")
+    return trades_log
+
+
+def send_telegram_message(message: str) -> None:
+    """Invia un messaggio di notifica su Telegram."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        logger.warning("Telegram non configurato (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID assenti). Salto la notifica.")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            logger.info("Notifica Telegram inviata con successo.")
+        else:
+            logger.error(f"Errore invio Telegram ({response.status_code}): {response.text}")
+    except Exception as e:
+        logger.error(f"Eccezione durante l'invio su Telegram: {e}")
 
 
 def main():
@@ -491,7 +569,9 @@ def main():
     any_action = False
     for ticker, sig in signals.items():
         action = sig["action"]
-        weight = sig.get("weight", 0.0)
+        # La strategia non ritorna "weight" direttamente, ma usa un peso base di config modificato dal confidence_multiplier
+        base_weight = config.BACKTEST_MAX_POSITION_SIZE
+        weight = sig.get("weight", base_weight * sig.get("confidence_multiplier", 1.0))
         if action != "HOLD":
             any_action = True
             logger.info(f"🟢 [SEGNALE] Ticker: {ticker:<6} | Azione: {action:<10} | Peso Allocazione: {weight*100:.2f}%")
@@ -503,13 +583,47 @@ def main():
     print("-"*50 + "\n")
 
     # 7. Esecuzione reale o simulata (Dry-Run)
+    mode_str = "REAL TRADE" if args.execute else "DRY RUN"
+    telegram_lines = []
+    
     if args.execute:
         logger.info("🚀 Modalità ESECUZIONE ATTIVA! Invio degli ordini di allineamento ad Alpaca...")
-        execute_trades_on_alpaca(alpaca_client, signals, portfolio, list(historical_data.keys()))
+        executed_trades = execute_trades_on_alpaca(alpaca_client, signals, portfolio, list(historical_data.keys()))
+        if executed_trades:
+            telegram_lines = executed_trades
+        else:
+            telegram_lines = ["Nessuna operazione eseguita (portafoglio già allineato)."]
         logger.info("Operatività di oggi completata con successo.")
     else:
         logger.info("ℹ️ Modalità DRY RUN (Simulazione). Nessun ordine inviato ad Alpaca.")
         logger.info("Usa il flag '--execute' per inviare realmente gli ordini in produzione.")
+        
+        # In simulazione, creiamo l'elenco delle operazioni raccomandate
+        recommended_trades = []
+        for ticker, sig in signals.items():
+            action = sig["action"]
+            if action != "HOLD":
+                db = DBManager()
+                last_price_df = db.execute_query("SELECT close FROM ohlcv WHERE ticker = ? ORDER BY timestamp DESC LIMIT 1", (ticker,))
+                last_close = float(last_price_df.iloc[0, 0]) if not last_price_df.empty else 0.0
+                sl_pct = sig.get("stop_loss_pct", 0.0)
+                tp_pct = sig.get("take_profit_pct", 0.0)
+                sl_price = round(last_close * (1.0 - sl_pct), 2) if action == "BUY" else round(last_close * (1.0 + sl_pct), 2)
+                tp_price = round(last_close * (1.0 + tp_pct), 2) if action == "BUY" else round(last_close * (1.0 - tp_pct), 2)
+                
+                recommended_trades.append(f"🤖 {action} {ticker} @ ${last_close:.2f} (SL: {sl_price}, TP: {tp_price})")
+        
+        if recommended_trades:
+            telegram_lines = recommended_trades
+        else:
+            telegram_lines = ["Nessun segnale operativo generato (Tutti i ticker sono HOLD)."]
+
+    # Invio del messaggio Telegram
+    telegram_msg = f"<b>[{mode_str}] Report Operazioni {args.model.upper()}</b>\n"
+    telegram_msg += f"Data: {current_date.strftime('%Y-%m-%d')}\n\n"
+    telegram_msg += "\n".join(telegram_lines)
+    
+    send_telegram_message(telegram_msg)
 
 
 if __name__ == "__main__":
