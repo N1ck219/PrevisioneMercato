@@ -33,4 +33,4 @@ jobs:
           ALPACA_PAPER: true
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python live_predict_trade.py -m nn_v6 --pool_size 100 --max_slots 8 --alphabetical
+        run: python live_predict_trade.py -m nn_v6 --pool_size 100 --max_slots 8 --alphabetical --execute
