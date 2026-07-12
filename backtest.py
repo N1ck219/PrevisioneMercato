@@ -17,7 +17,7 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 import config
 from backtest.engine import BacktestEngine, Portfolio
-from backtest.strategy import SMAXStrategy, NeuralNetworkStrategy, NeuralNetworkV2Strategy, NeuralNetworkV3Strategy, NeuralNetworkV4Strategy, NeuralNetworkV5Strategy, NeuralNetworkV6Strategy, NeuralNetworkV7Strategy, NeuralNetworkV8Strategy, NeuralNetworkV9Strategy, NeuralNetworkV10Strategy, NeuralNetworkV11Strategy, MoEStrategyV1
+from backtest.strategy import SMAXStrategy, NeuralNetworkStrategy, NeuralNetworkV2Strategy, NeuralNetworkV3Strategy, NeuralNetworkV4Strategy, NeuralNetworkV5Strategy, NeuralNetworkV6Strategy, NeuralNetworkV7Strategy, NeuralNetworkV8Strategy, NeuralNetworkV9Strategy, NeuralNetworkV10Strategy, NeuralNetworkV11Strategy, MoEStrategyV1, NeuralNetworkGNNStrategy
 from database.db_manager import DBManager
 
 # Configurazione del logger
@@ -83,7 +83,7 @@ def main():
         "-s", "--strategy",
         type=str,
         default="nn_v1",
-        choices=["nn_v1", "nn_v2", "nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v7", "nn_v8", "nn_v9", "nn_v10", "nn_v11", "moe_v1", "sma"],
+        choices=["nn_v1", "nn_v2", "nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v7", "nn_v8", "nn_v9", "nn_v10", "nn_v11", "moe_v1", "gnn_v1", "sma"],
         help="La strategia/modello da simulare (default: nn_v1)."
     )
     
@@ -299,6 +299,7 @@ def main():
         "nn_v10": "neural_model_v10.pth",
         "nn_v11": "neural_model_v11.pth",
         "moe_v1": "neural_model_moe.pth",
+        "gnn_v1": "gnn_model.pth",
     }
     model_to_use = args.model_file if args.model_file is not None else default_models.get(args.strategy, "neural_model.pth")
     
@@ -327,6 +328,29 @@ def main():
             dynamic_slots=not args.no_dynamic_slots,
             base_max_slots=args.max_slots,
             short_breadth_thresh=args.short_breadth_thresh
+        )
+    elif args.strategy == "gnn_v1":
+        model_path = config.BASE_DIR / "models" / "gnn" / "v1" / "pesi" / model_to_use
+        if not model_path.exists():
+            fallback_model = "gnn_model.pth"
+            fallback_path = config.BASE_DIR / "models" / "gnn" / "v1" / "pesi" / fallback_model
+            if fallback_path.exists():
+                logger.warning(f"File '{model_to_use}' non trovato. Ripiego sul modello di prova addestrato '{fallback_model}'.")
+                model_to_use = fallback_model
+                
+        strategy_class = lambda: NeuralNetworkGNNStrategy(
+            model_filename=model_to_use,
+            probability_threshold=args.probability_threshold,
+            ranking_mode=not args.no_ranking,
+            trend_filter=not args.no_trend_filter,
+            probability_threshold_long=args.prob_threshold_long,
+            probability_threshold_short=args.prob_threshold_short,
+            top_pct=args.top_pct,
+            exit_pct=args.exit_pct,
+            stop_loss_atr_mult=args.stop_loss_atr_mult,
+            take_profit_mult=args.take_profit_mult,
+            use_trailing_only=args.use_trailing_only,
+            trailing_stop_atr_mult=args.trailing_stop_atr_mult
         )
     elif args.strategy == "nn_v11":
         model_path = config.BASE_DIR / "models" / "rete_neurale" / "v11" / "pesi" / model_to_use

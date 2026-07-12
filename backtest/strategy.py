@@ -4758,3 +4758,321 @@ class MoEStrategyV1(BaseStrategy):
                         
         return signals
 
+
+class NeuralNetworkGNNStrategy(BaseStrategy):
+    """
+    Strategia quantitativa basata sul modello Spatio-Temporal GNN v1.
+    Carica i pesi GNN, calcola la griglia delle feature per tutti i ticker e
+    genera segnali di trading stabili basati sulla matrice di adiacenza del grafo,
+    sulla forza relativa (ranking) e su filtri di trend macro.
+    """
+    def __init__(
+        self, 
+        model_filename: str = "gnn_model.pth", 
+        probability_threshold: float = 0.55,
+        ranking_mode: bool = True,
+        top_pct: float = 0.05,
+        exit_pct: float = 0.60,
+        trend_filter: bool = True,
+        probability_threshold_long: Optional[float] = None,
+        probability_threshold_short: Optional[float] = None,
+        stop_loss_atr_mult: float = 4.0,
+        take_profit_mult: float = 2.0,
+        use_trailing_only: bool = False,
+        trailing_stop_atr_mult: float = 3.0
+    ) -> None:
+        import sys
+        import torch
+        from pathlib import Path
+        
+        sys.path.append(str(Path(__file__).resolve().parent.parent))
+        from models.gnn.v1.model import SpatioTemporalGNNV1
+        from database.db_manager import DBManager
+        
+        self.probability_threshold = probability_threshold
+        self.ranking_mode = ranking_mode
+        self.top_pct = top_pct
+        self.exit_pct = exit_pct
+        self.trend_filter = trend_filter
+        self.probability_threshold_long = probability_threshold_long
+        self.probability_threshold_short = probability_threshold_short
+        self.stop_loss_atr_mult = stop_loss_atr_mult
+        self.take_profit_mult = take_profit_mult
+        self.use_trailing_only = use_trailing_only
+        self.trailing_stop_atr_mult = trailing_stop_atr_mult
+        
+        model_path = Path(__file__).resolve().parent.parent / "models" / "gnn" / "v1" / "pesi" / model_filename
+        
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Impossibile avviare la strategia GNN: file dei pesi non trovato in: {model_path}."
+            )
+            
+        logger = logging.getLogger("NeuralNetworkGNNStrategy")
+        logger.info(f"Caricamento del modello GNN da: {model_path}...")
+        
+        state = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+        self.feature_cols = state["feature_cols"]
+        self.mean = np.array(state["scaling_mean"])
+        self.std = np.array(state["scaling_std"])
+        self.input_dim = state["input_dim"]
+        self.lookback = state.get("lookback", 30)
+        self.adj_matrix = torch.tensor(state["adj"], dtype=torch.float32)
+        
+        # Risoluzione della lista ticker
+        db = DBManager()
+        all_db_tickers = sorted(db.execute_query("SELECT DISTINCT ticker FROM ohlcv")['ticker'].tolist())
+        num_nodes = len(state["adj"])
+        if "tickers" in state:
+            self.tickers_list = state["tickers"]
+        else:
+            self.tickers_list = all_db_tickers[:num_nodes]
+            logger.warning(
+                f"Modello sprovvisto di lista ticker salvata. Ripiego sui primi {num_nodes} ticker in ordine alfabetico a DB."
+            )
+            
+        # Carica il modello GNN
+        self.model = SpatioTemporalGNNV1(input_dim=self.input_dim, hidden_dim=state.get("hidden_dim", 32))
+        self.model.load(str(model_path))
+        logger.info("Modello GNN e parametri di scaling caricati correttamente.")
+
+    def generate_signals(
+        self,
+        historical_data: Dict[str, pd.DataFrame],
+        portfolio: Any,
+        current_date: datetime
+    ) -> Dict[str, Dict[str, Any]]:
+        import torch
+        
+        signals: Dict[str, Dict[str, Any]] = {}
+        
+        N = len(self.tickers_list)
+        L = self.lookback
+        F = len(self.feature_cols)
+        
+        grid_data = np.zeros((N, L, F), dtype=np.float32)
+        valid_tickers_mask = np.zeros(N, dtype=bool)
+        
+        for idx, ticker in enumerate(self.tickers_list):
+            if ticker not in historical_data:
+                continue
+            df = historical_data[ticker]
+            if len(df) < L + 200:
+                continue
+                
+            close_series = df['close']
+            
+            # Calcolo delle feature scala-invarianti standard sullo storico del ticker
+            sma_10_r = df['sma_10'] / close_series
+            sma_20_r = df['sma_20'] / close_series
+            sma_50_r = df['sma_50'] / close_series
+            sma_200_r = df['sma_200'] / close_series
+            ema_9_r = df['ema_9'] / close_series
+            ema_21_r = df['ema_21'] / close_series
+            bb_u_r = df['bb_upper'] / close_series
+            bb_l_r = df['bb_lower'] / close_series
+            macd_r = df['macd'] / close_series
+            macd_s_r = df['macd_signal'] / close_series
+            macd_h_r = df['macd_hist'] / close_series
+            atr_r = df['atr_14'] / close_series
+            volume_r = df['volume'] / df['volume'].rolling(10).mean()
+            rsi_norm = df['rsi_14'] / 100.0
+            
+            feat_dict = {
+                'sma_10_ratio': sma_10_r,
+                'sma_20_ratio': sma_20_r,
+                'sma_50_ratio': sma_50_r,
+                'sma_200_ratio': sma_200_r,
+                'ema_9_ratio': ema_9_r,
+                'ema_21_ratio': ema_21_r,
+                'bb_upper_ratio': bb_u_r,
+                'bb_lower_ratio': bb_l_r,
+                'macd_ratio': macd_r,
+                'macd_signal_ratio': macd_s_r,
+                'macd_hist_ratio': macd_h_r,
+                'atr_14_ratio': atr_r,
+                'volume_ratio': volume_r,
+                'rsi_14_norm': rsi_norm
+            }
+            
+            # Estraiamo gli ultimi L elementi e applichiamo lo scaling
+            ticker_features = []
+            has_nan = False
+            for lookback_idx in range(-L, 0):
+                check_cols = ['close', 'volume', 'sma_10', 'sma_20', 'sma_50', 'sma_200', 'rsi_14', 'bb_upper', 'bb_lower', 'atr_14']
+                if df.iloc[lookback_idx][check_cols].isna().any():
+                    has_nan = True
+                    break
+                    
+                vec = []
+                for col in self.feature_cols:
+                    val = feat_dict[col].iloc[lookback_idx]
+                    vec.append(val)
+                
+                vec_scaled = (np.array(vec) - self.mean) / self.std
+                ticker_features.append(vec_scaled)
+                
+            if not has_nan and len(ticker_features) == L:
+                grid_data[idx] = np.array(ticker_features, dtype=np.float32)
+                valid_tickers_mask[idx] = True
+                
+        # Creiamo il tensore (1, N, L, F)
+        X_tensor = torch.as_tensor(grid_data, dtype=torch.float32).unsqueeze(0)
+        
+        # Predict con il modello GNN
+        self.model.model.eval()
+        with torch.no_grad():
+            probs = self.model.predict(X_tensor, adj=self.adj_matrix)[0] # (N,)
+            
+        # Raccogliamo le probabilità per i soli ticker attivi e validi simulati
+        valid_active_tickers = []
+        valid_active_probs = []
+        ticker_dfs = {}
+        
+        for idx, ticker in enumerate(self.tickers_list):
+            if not valid_tickers_mask[idx]:
+                continue
+            valid_active_tickers.append(ticker)
+            valid_active_probs.append(float(probs[idx]))
+            ticker_dfs[ticker] = historical_data[ticker]
+            
+        if not valid_active_tickers:
+            return signals
+            
+        # Calcolo delle soglie dinamiche basate sui percentili
+        pct_long_val = float(np.percentile(valid_active_probs, 85)) if len(valid_active_probs) > 1 else self.probability_threshold
+        pct_short_val = float(np.percentile(valid_active_probs, 15)) if len(valid_active_probs) > 1 else 0.0
+        
+        if self.probability_threshold_long is not None:
+            pct_long_val = self.probability_threshold_long
+        if self.probability_threshold_short is not None:
+            pct_short_val = self.probability_threshold_short
+            
+        pct_exit_long_val = float(np.percentile(valid_active_probs, 35)) if len(valid_active_probs) > 1 else (1.0 - self.probability_threshold + 0.10)
+        pct_exit_short_val = float(np.percentile(valid_active_probs, 65)) if len(valid_active_probs) > 1 else (self.probability_threshold - 0.10)
+        
+        if self.ranking_mode:
+            ticker_probs_dict = {t: p for t, p in zip(valid_active_tickers, valid_active_probs)}
+            sorted_tickers = sorted(ticker_probs_dict.items(), key=lambda x: x[1], reverse=True)
+            
+            N_active = len(valid_active_tickers)
+            K = max(1, int(N_active * self.top_pct))
+            top_K_tickers = set([t[0] for t in sorted_tickers[:K]])
+            bottom_K_tickers = set([t[0] for t in sorted_tickers[-K:]])
+            
+            K_out = max(1, int(N_active * self.exit_pct))
+            top_out_tickers = set([t[0] for t in sorted_tickers[:K_out]])
+            bottom_out_tickers = set([t[0] for t in sorted_tickers[-K_out:]])
+            
+            for ticker, prob in zip(valid_active_tickers, valid_active_probs):
+                df = ticker_dfs[ticker]
+                latest_row = df.iloc[-1]
+                close = latest_row['close']
+                sma_200 = latest_row.get('sma_200', np.nan)
+                
+                is_uptrend = (close >= sma_200) if pd.notna(sma_200) else True
+                
+                if self.trend_filter:
+                    if is_uptrend:
+                        thresh_long = pct_long_val
+                        thresh_short = 0.0
+                    else:
+                        thresh_long = 1.0 # Impossibile da superare
+                        thresh_short = pct_short_val
+                else:
+                    thresh_long = pct_long_val
+                    thresh_short = pct_short_val
+                    
+                if ticker in portfolio.positions:
+                    pos = portfolio.positions[ticker]
+                    days_held = (current_date - pos.entry_date).days
+                    
+                    if pos.position_type == "LONG":
+                        should_exit = (
+                            prob < pct_exit_long_val or 
+                            (self.trend_filter and not is_uptrend) or
+                            (ticker not in top_out_tickers and days_held >= 3)
+                        )
+                        if should_exit:
+                            signals[ticker] = {"action": "SELL", "probability": prob}
+                        else:
+                            signals[ticker] = {"action": "HOLD", "probability": prob}
+                    else: # SHORT
+                        should_exit = (
+                            prob > pct_exit_short_val or 
+                            (self.trend_filter and is_uptrend) or
+                            (ticker not in bottom_out_tickers and days_held >= 3)
+                        )
+                        if should_exit:
+                            signals[ticker] = {"action": "BUY_TO_COVER", "probability": prob}
+                        else:
+                            signals[ticker] = {"action": "HOLD", "probability": prob}
+                else:
+                    atr = latest_row['atr_14']
+                    stop_loss_pct = (self.stop_loss_atr_mult * atr) / (close + 1e-9)
+                    stop_loss_pct = float(np.clip(stop_loss_pct, 0.02, 0.08))
+                    
+                    if self.use_trailing_only:
+                        take_profit_pct = None
+                    else:
+                        take_profit_pct = float(stop_loss_pct * self.take_profit_mult)
+                        
+                    trailing_stop_pct = (self.trailing_stop_atr_mult * atr) / (close + 1e-9)
+                    trailing_stop_pct = float(np.clip(trailing_stop_pct, 0.02, 0.08))
+                    
+                    if ticker in top_K_tickers and prob >= thresh_long:
+                        signals[ticker] = {
+                            "action": "BUY",
+                            "probability": 0.99,  # Forza il passaggio del filtro rigido del motore di backtest
+                            "stop_loss_pct": stop_loss_pct,
+                            "take_profit_pct": take_profit_pct,
+                            "trailing_stop_pct": trailing_stop_pct
+                        }
+                    elif ticker in bottom_K_tickers and prob <= thresh_short:
+                        signals[ticker] = {
+                            "action": "SELL_SHORT",
+                            "probability": 0.01,  # Forza il passaggio del filtro rigido del motore di backtest per shorting (prob <= 1 - threshold)
+                            "stop_loss_pct": stop_loss_pct,
+                            "take_profit_pct": take_profit_pct,
+                            "trailing_stop_pct": trailing_stop_pct
+                        }
+                    else:
+                        signals[ticker] = {"action": "HOLD", "probability": prob}
+        else:
+            # Modalità standard senza ranking
+            for ticker, prob in zip(valid_active_tickers, valid_active_probs):
+                df = ticker_dfs[ticker]
+                latest_row = df.iloc[-1]
+                close = latest_row['close']
+                
+                if ticker in portfolio.positions:
+                    pos = portfolio.positions[ticker]
+                    if pos.position_type == "LONG":
+                        if prob < (1 - self.probability_threshold + 0.10):
+                            signals[ticker] = {"action": "SELL", "probability": prob}
+                        else:
+                            signals[ticker] = {"action": "HOLD", "probability": prob}
+                    else: # SHORT
+                        if prob > (self.probability_threshold - 0.10):
+                            signals[ticker] = {"action": "BUY_TO_COVER", "probability": prob}
+                        else:
+                            signals[ticker] = {"action": "HOLD", "probability": prob}
+                else:
+                    atr = latest_row['atr_14']
+                    stop_loss_pct = (4.0 * atr) / (close + 1e-9)
+                    stop_loss_pct = float(np.clip(stop_loss_pct, 0.015, 0.08))
+                    take_profit_pct = float(stop_loss_pct * 2.0)
+                    
+                    if prob >= self.probability_threshold:
+                        signals[ticker] = {
+                            "action": "BUY",
+                            "probability": prob,
+                            "stop_loss_pct": stop_loss_pct,
+                            "take_profit_pct": take_profit_pct
+                        }
+                    else:
+                        signals[ticker] = {"action": "HOLD", "probability": prob}
+                        
+        return signals
+
+

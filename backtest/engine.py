@@ -732,6 +732,8 @@ class BacktestEngine:
         strat_lower = strategy_name.lower()
         if "moe" in strat_lower:
             model_subfolder = "moe"
+        elif "gnn" in strat_lower:
+            model_subfolder = "gnn"
         elif "neuralnetwork" in strat_lower or "nn" in strat_lower:
             model_subfolder = "neural_network"
         elif "transformer" in strat_lower:

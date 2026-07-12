@@ -8,6 +8,8 @@ from typing import List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
+
 
 # Silenzia avvisi deprecati o future warnings di PyTorch e altre librerie
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -27,6 +29,7 @@ from models.rete_neurale.v6.model import NeuralNetworkV6
 from models.rete_neurale.v10.model import NeuralNetworkV10
 from models.rete_neurale.v11.model import NeuralNetworkV11
 from models.rete_neurale.moe_v1.model import MoEModelV1
+from models.gnn.v1.model import SpatioTemporalGNNV1
 
 # Configurazione del logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -361,7 +364,7 @@ def create_temporal_sequences_v5(
     X_val_list, y_val_list, ret_val_list = [], [], []
     X_test_list, y_test_list, ret_test_list = [], [], []
     
-    for ticker, group in df_scaled.groupby('ticker'):
+    for ticker, group in tqdm(df_scaled.groupby('ticker'), desc="Creazione sequenze temporali v5", leave=False):
         group_sorted = group.sort_values('timestamp').reset_index(drop=True)
         if len(group_sorted) < lookback:
             continue
@@ -413,7 +416,7 @@ def create_temporal_sequences(
     X_test_list, y_test_list = [], []
     
     # Raggruppa per ticker
-    for ticker, group in df_scaled.groupby('ticker'):
+    for ticker, group in tqdm(df_scaled.groupby('ticker'), desc="Creazione sequenze temporali", leave=False):
         group_sorted = group.sort_values('timestamp').reset_index(drop=True)
         if len(group_sorted) < lookback:
             continue
@@ -606,7 +609,7 @@ def create_temporal_sequences_v11(
     X_val_list, y_val_list, ret_val_list, crash_val_list = [], [], [], []
     X_test_list, y_test_list, ret_test_list, crash_test_list = [], [], [], []
     
-    for ticker, group in df_scaled.groupby('ticker'):
+    for ticker, group in tqdm(df_scaled.groupby('ticker'), desc="Creazione sequenze temporali v11", leave=False):
         group_sorted = group.sort_values('timestamp').reset_index(drop=True)
         if len(group_sorted) < lookback:
             continue
@@ -694,7 +697,7 @@ def create_temporal_sequences_moe(
     X_val_list, y_val_list, ret_val_list, crash_val_list, reg_val_list = [], [], [], [], []
     X_test_list, y_test_list, ret_test_list, crash_test_list, reg_test_list = [], [], [], [], []
     
-    for ticker, group in df_scaled.groupby('ticker'):
+    for ticker, group in tqdm(df_scaled.groupby('ticker'), desc="Creazione sequenze temporali moe", leave=False):
         group_sorted = group.sort_values('timestamp').reset_index(drop=True)
         if len(group_sorted) < lookback:
             continue
@@ -749,7 +752,7 @@ def main():
         "-m", "--model",
         type=str,
         default="nn_v1",
-        choices=["nn_v1", "nn_v2", "nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v10", "nn_v11", "moe_v1"],
+        choices=["nn_v1", "nn_v2", "nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v10", "nn_v11", "moe_v1", "gnn_v1"],
         help="Il tipo di modello da allenare (default: nn_v1)."
     )
     
@@ -838,6 +841,10 @@ def main():
     
     args = parser.parse_args()
     
+    if args.model == "gnn_v1" and args.batch_size > 32:
+        logger.warning(f"Batch size {args.batch_size} è troppo grande per la GNN Spazio-Temporale (richiederebbe circa 15GB di VRAM). Auto-riduzione a 16 per prevenire CUDA Out of Memory.")
+        args.batch_size = 16
+        
     logger.info("=== AVVIO UNIFICATO PIPELINE DI ADDESTRAMENTO ===")
     
     db = DBManager()
@@ -959,8 +966,8 @@ def main():
     std = X_train_raw.std(axis=0)
     std[std == 0.0] = 1e-8  # Previene la divisione per zero
     
-    # Se il modello è sequenziale (nn_v3, nn_v4, nn_v5, nn_v6, nn_v10, nn_v11, moe_v1), creiamo le sequenze 3D
-    if args.model in ["nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v10", "nn_v11", "moe_v1"]:
+    # Se il modello è sequenziale (nn_v3, nn_v4, nn_v5, nn_v6, nn_v10, nn_v11, moe_v1, gnn_v1), creiamo le sequenze 3D
+    if args.model in ["nn_v3", "nn_v4", "nn_v5", "nn_v6", "nn_v10", "nn_v11", "moe_v1", "gnn_v1"]:
         logger.info(f"Creazione delle sequenze temporali per {args.model.upper()} con lookback = {args.lookback}...")
         train_cutoff_time = pd.Timestamp(df_train['timestamp'].iloc[-1])
         val_cutoff_time = pd.Timestamp(df_val['timestamp'].iloc[-1])
@@ -981,6 +988,73 @@ def main():
             X_train, y_train, ret_train, X_val, y_val, ret_val, X_test, y_test, ret_test = create_temporal_sequences_v5(
                 df_scaled, feature_cols, args.lookback, train_cutoff_time, val_cutoff_time
             )
+        elif args.model == "gnn_v1":
+            # For GNN, we align cross-sectionally. We can reconstruct spatiotemporal tensors (B, N, L, F)
+            # Find unique tickers and timestamps
+            tickers_list = sorted(df_scaled['ticker'].unique())
+            
+            # Align sequences on a unified grid per split: Train, Val, Test
+            def build_gnn_grid_dataset(df_split):
+                if df_split.empty:
+                    return np.empty((0, len(tickers_list), args.lookback, len(feature_cols))), np.empty((0, len(tickers_list)))
+                
+                timestamps = sorted(df_split['timestamp'].unique())
+                if len(timestamps) < args.lookback:
+                    return np.empty((0, len(tickers_list), args.lookback, len(feature_cols))), np.empty((0, len(tickers_list)))
+                
+                # Create a multi-index representing the full grid of (timestamp x ticker)
+                full_index = pd.MultiIndex.from_product([timestamps, tickers_list], names=['timestamp', 'ticker'])
+                
+                # Reindex df_split to the full grid, filling missing values
+                df_grid = df_split.set_index(['timestamp', 'ticker']).reindex(full_index)
+                
+                # Reshape features and targets
+                T = len(timestamps)
+                N = len(tickers_list)
+                features_grid = df_grid[feature_cols].fillna(0.0).values.reshape(T, N, len(feature_cols))
+                targets_grid = df_grid['target'].fillna(0).astype(int).values.reshape(T, N)
+                
+                # Filter out snapshots with less than 50% non-NaN data in the original df_split
+                ticker_counts = df_split.groupby('timestamp')['ticker'].nunique()
+                valid_timestamps = ticker_counts[ticker_counts >= N * 0.5].index
+                
+                # Filter the grid arrays
+                valid_timestamps_set = set(valid_timestamps)
+                valid_mask = np.array([ts in valid_timestamps_set for ts in timestamps])
+                grid_data = features_grid[valid_mask]
+                grid_targets = targets_grid[valid_mask]
+                
+                if len(grid_data) < args.lookback:
+                    return np.empty((0, len(tickers_list), args.lookback, len(feature_cols))), np.empty((0, len(tickers_list)))
+                
+                X_win = []
+                y_win = []
+                for i in range(len(grid_data) - args.lookback):
+                    X_win.append(grid_data[i : i + args.lookback])
+                    y_win.append(grid_targets[i + args.lookback])
+                
+                # Transpose to (B, N, L, F)
+                X_arr = np.array(X_win).transpose(0, 2, 1, 3)
+                y_arr = np.array(y_win)
+                return X_arr, y_arr
+            
+            X_train, y_train = build_gnn_grid_dataset(df_scaled[df_scaled['timestamp'] <= train_cutoff_time])
+            X_val, y_val = build_gnn_grid_dataset(df_scaled[(df_scaled['timestamp'] > train_cutoff_time) & (df_scaled['timestamp'] <= val_cutoff_time)])
+            X_test, y_test = build_gnn_grid_dataset(df_scaled[df_scaled['timestamp'] > val_cutoff_time])
+            
+            # Compute pearson correlation for Adjacency matrix using training returns (feature_cols[0])
+            if len(X_train) > 0 and len(tickers_list) > 1:
+                returns_matrix = X_train[:, :, -1, 0].T # (N, B)
+                corr = np.corrcoef(returns_matrix)
+                corr = np.nan_to_num(corr)
+                # Threshold at 0.3 correlation
+                adj_matrix = (np.abs(corr) > 0.3).astype(float)
+                np.fill_diagonal(adj_matrix, 1.0)
+            else:
+                adj_matrix = np.eye(len(tickers_list))
+            
+            # Keep adjacency matrix as an instance attribute of the model wrapper later
+            args.gnn_adj = torch.tensor(adj_matrix, dtype=torch.float32)
         else:
             X_train, y_train, X_val, y_val, X_test, y_test = create_temporal_sequences(
                 df_scaled, feature_cols, args.lookback, train_cutoff_time, val_cutoff_time
@@ -1051,6 +1125,9 @@ def main():
     elif args.model == "nn_v2":
         model = NeuralNetworkV2(input_dim=input_dim)
         pesi_dir = config.BASE_DIR / "models" / "rete_neurale" / "v2" / "pesi"
+    elif args.model == "gnn_v1":
+        model = SpatioTemporalGNNV1(input_dim=input_dim)
+        pesi_dir = config.BASE_DIR / "models" / "gnn" / "v1" / "pesi"
     else:
         model = NeuralNetworkV1(input_dim=input_dim)
         pesi_dir = config.BASE_DIR / "models" / "rete_neurale" / "v1" / "pesi"
@@ -1109,6 +1186,18 @@ def main():
             early_stopping_rounds=args.patience,
             verbose=True
         )
+    elif args.model == "gnn_v1":
+        history = model.train(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            adj=args.gnn_adj,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            early_stopping_rounds=args.patience,
+            verbose=True
+        )
     else:
         history = model.train(
             X_train=X_train,
@@ -1121,8 +1210,25 @@ def main():
             verbose=True
         )
     
+    # 6.5. Salvataggio della cronologia di addestramento (history) in un file CSV
+    try:
+        history_df = pd.DataFrame(history)
+        history_df.index = history_df.index + 1
+        history_df.index.name = "epoch"
+        history_csv_path = pesi_dir / f"{Path(args.save_name).stem}_history.csv"
+        # Assicuriamoci che la directory esista prima di salvare
+        pesi_dir.mkdir(exist_ok=True, parents=True)
+        history_df.to_csv(history_csv_path)
+        logger.info(f"Cronologia di addestramento (history) salvata con successo in: {history_csv_path}")
+    except Exception as e:
+        logger.error(f"Errore nel salvataggio della history in CSV: {e}")
+        
     # 7. Valutazione sul Test Set (Out-of-sample)
-    test_probs = model.predict(X_test)
+    if args.model == "gnn_v1":
+        test_probs = model.predict(X_test, adj=args.gnn_adj)
+    else:
+        test_probs = model.predict(X_test)
+        
     test_preds = (test_probs > 0.50).astype(int)
     test_accuracy = np.mean(test_preds == y_test)
     
@@ -1163,6 +1269,11 @@ def main():
         state["num_layers"] = model.num_layers
     elif args.model == "nn_v3":
         state["lookback"] = args.lookback
+    elif args.model == "gnn_v1":
+        state["lookback"] = args.lookback
+        state["hidden_dim"] = model.hidden_dim
+        state["adj"] = args.gnn_adj.cpu().tolist()
+        state["tickers"] = tickers_list
         
     torch.save(state, filepath)
     logger.info(f"Addestramento concluso con successo! Modello e parametri salvati in: {filepath}")
