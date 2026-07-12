@@ -1,11 +1,7 @@
 name: Daily Live Trading
 
 on:
-  schedule:
-    # Esegue il workflow da lunedì a venerdì alle 19:45 UTC (21:45 italiane / 15:45 di New York)
-    # Questo lascia 15 minuti di margine prima della chiusura di Wall Street (16:00 NY time)
-    - cron: '45 19 * * 1-5'
-  workflow_dispatch: # Permette l'avvio manuale da GitHub
+  workflow_dispatch: # Abilita l'avvio preciso controllato dall'esterno tramite API
 
 jobs:
   trade:
