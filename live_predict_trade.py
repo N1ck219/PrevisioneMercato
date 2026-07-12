@@ -111,8 +111,10 @@ class AlpacaClient:
     ) -> Dict[str, Any]:
         """Invia un ordine ad Alpaca (supporta ordini bracket per SL/TP)."""
         url = f"{self.base_url}/v2/orders"
+        # Alpaca richiede il punto per le classi di azioni (es. BRK.B invece di BRK-B)
+        alpaca_ticker = ticker.replace('-', '.')
         data = {
-            "symbol": ticker,
+            "symbol": alpaca_ticker,
             "qty": str(qty),
             "side": side.lower(),  # "buy" o "sell"
             "type": order_type,
@@ -128,7 +130,7 @@ class AlpacaClient:
                 
         response = requests.post(url, json=data, headers=self.headers, timeout=15)
         if response.status_code != 200 and response.status_code != 201:
-            logger.error(f"Errore invio ordine per {ticker}: {response.text}")
+            logger.error(f"Errore invio ordine per {ticker} (Alpaca: {alpaca_ticker}): {response.text}")
         response.raise_for_status()
         return response.json()
 
@@ -293,7 +295,8 @@ def rebuild_portfolio_state(alpaca_client: AlpacaClient) -> Portfolio:
 
     # Popoliamo con le posizioni reali attive su Alpaca
     for pos in positions_info:
-        ticker = pos["symbol"]
+        # Sincronizziamo il simbolo con il formato locale (es. BRK.B -> BRK-B)
+        ticker = pos["symbol"].replace('.', '-')
         qty = float(pos["qty"])
         avg_entry_price = float(pos["avg_entry_price"])
         current_price = float(pos["current_price"])
