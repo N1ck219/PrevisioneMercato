@@ -360,37 +360,60 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
                (action == "BUY_TO_COVER" and pos.position_type == "SHORT"):
                 msg = f"🔄 Chiusura posizione su {ticker} ({pos.position_type}): {pos.shares} quote."
                 logger.info(f"[ORDINE] {msg}")
+                closed_successfully = False
                 try:
                     alpaca_client.close_position(ticker=ticker)
+                    closed_successfully = True
                 except Exception as e:
-                    logger.warning(f"Chiusura tramite API DELETE fallita per {ticker}: {e}. Provo a cancellare ordini e inviare ordine manuale.")
-                    alpaca_client.cancel_orders_for_symbol(ticker)
-                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
-                trades_log.append(msg)
-                # Aggiorniamo lo stato locale del portafoglio per il conteggio degli slot
-                del portfolio.positions[ticker]
+                    logger.warning(f"Chiusura diretta API DELETE fallita per {ticker}: {e}. Tento cancellazione ordini pendenti...")
+                    try:
+                        alpaca_client.cancel_orders_for_symbol(ticker)
+                        alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
+                        closed_successfully = True
+                    except Exception as err:
+                        logger.error(f"Impossibile chiudere la posizione su {ticker}: {err}")
+
+                if closed_successfully:
+                    trades_log.append(msg)
+                    del portfolio.positions[ticker]
             
             # Se abbiamo una posizione opposta a quella voluta
             elif action == "BUY" and pos.position_type == "SHORT":
                 msg = f"🔄 Inversione: Chiusura SHORT di {pos.shares} quote su {ticker}."
                 logger.info(f"[ORDINE] {msg}")
+                closed_successfully = False
                 try:
                     alpaca_client.close_position(ticker=ticker)
+                    closed_successfully = True
                 except Exception as e:
-                    alpaca_client.cancel_orders_for_symbol(ticker)
-                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
-                trades_log.append(msg)
-                del portfolio.positions[ticker]
+                    try:
+                        alpaca_client.cancel_orders_for_symbol(ticker)
+                        alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
+                        closed_successfully = True
+                    except Exception as err:
+                        logger.error(f"Impossibile chiudere la posizione SHORT su {ticker}: {err}")
+
+                if closed_successfully:
+                    trades_log.append(msg)
+                    del portfolio.positions[ticker]
             elif action == "SELL_SHORT" and pos.position_type == "LONG":
                 msg = f"🔄 Inversione: Chiusura LONG di {pos.shares} quote su {ticker}."
                 logger.info(f"[ORDINE] {msg}")
+                closed_successfully = False
                 try:
                     alpaca_client.close_position(ticker=ticker)
+                    closed_successfully = True
                 except Exception as e:
-                    alpaca_client.cancel_orders_for_symbol(ticker)
-                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
-                trades_log.append(msg)
-                del portfolio.positions[ticker]
+                    try:
+                        alpaca_client.cancel_orders_for_symbol(ticker)
+                        alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
+                        closed_successfully = True
+                    except Exception as err:
+                        logger.error(f"Impossibile chiudere la posizione LONG su {ticker}: {err}")
+
+                if closed_successfully:
+                    trades_log.append(msg)
+                    del portfolio.positions[ticker]
 
     # 2. Gestione degli Acquisti / Apertura Posizioni
     # Recuperiamo l'equity per calcolare le size corrette
