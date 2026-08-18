@@ -134,6 +134,26 @@ class AlpacaClient:
         response.raise_for_status()
         return response.json()
 
+    def cancel_orders_for_symbol(self, ticker: str) -> List[Dict[str, Any]]:
+        """Cancella tutti gli ordini pendenti per un dato ticker."""
+        url = f"{self.base_url}/v2/orders"
+        alpaca_ticker = ticker.replace('-', '.')
+        params = {"symbol": alpaca_ticker, "status": "open"}
+        response = requests.delete(url, headers=self.headers, params=params, timeout=10)
+        if response.status_code == 200 or response.status_code == 207:
+            return response.json()
+        return []
+
+    def close_position(self, ticker: str) -> Dict[str, Any]:
+        """Chiude direttamente la posizione su Alpaca tramite l'endpoint dedicato DELETE /v2/positions/{symbol}."""
+        alpaca_ticker = ticker.replace('-', '.')
+        url = f"{self.base_url}/v2/positions/{alpaca_ticker}"
+        response = requests.delete(url, headers=self.headers, timeout=15)
+        if response.status_code != 200 and response.status_code != 201:
+            logger.error(f"Errore chiusura posizione per {ticker} (Alpaca: {alpaca_ticker}): {response.text}")
+        response.raise_for_status()
+        return response.json()
+
     def close_all_positions(self) -> List[Dict[str, Any]]:
         """Liquida tutte le posizioni aperte."""
         url = f"{self.base_url}/v2/positions"
@@ -340,7 +360,12 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
                (action == "BUY_TO_COVER" and pos.position_type == "SHORT"):
                 msg = f"🔄 Chiusura posizione su {ticker} ({pos.position_type}): {pos.shares} quote."
                 logger.info(f"[ORDINE] {msg}")
-                alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
+                try:
+                    alpaca_client.close_position(ticker=ticker)
+                except Exception as e:
+                    logger.warning(f"Chiusura tramite API DELETE fallita per {ticker}: {e}. Provo a cancellare ordini e inviare ordine manuale.")
+                    alpaca_client.cancel_orders_for_symbol(ticker)
+                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell" if pos.position_type == "LONG" else "buy")
                 trades_log.append(msg)
                 # Aggiorniamo lo stato locale del portafoglio per il conteggio degli slot
                 del portfolio.positions[ticker]
@@ -349,13 +374,21 @@ def execute_trades_on_alpaca(alpaca_client: AlpacaClient, signals: Dict[str, Dic
             elif action == "BUY" and pos.position_type == "SHORT":
                 msg = f"🔄 Inversione: Chiusura SHORT di {pos.shares} quote su {ticker}."
                 logger.info(f"[ORDINE] {msg}")
-                alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
+                try:
+                    alpaca_client.close_position(ticker=ticker)
+                except Exception as e:
+                    alpaca_client.cancel_orders_for_symbol(ticker)
+                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="buy")
                 trades_log.append(msg)
                 del portfolio.positions[ticker]
             elif action == "SELL_SHORT" and pos.position_type == "LONG":
                 msg = f"🔄 Inversione: Chiusura LONG di {pos.shares} quote su {ticker}."
                 logger.info(f"[ORDINE] {msg}")
-                alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
+                try:
+                    alpaca_client.close_position(ticker=ticker)
+                except Exception as e:
+                    alpaca_client.cancel_orders_for_symbol(ticker)
+                    alpaca_client.submit_order(ticker=ticker, qty=pos.shares, side="sell")
                 trades_log.append(msg)
                 del portfolio.positions[ticker]
 
